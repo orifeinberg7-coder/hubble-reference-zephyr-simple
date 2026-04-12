@@ -6,7 +6,6 @@
 #include <zephyr/logging/log.h>
 
 #include <hubble/hubble.h>
-#include <hubble/hubble_ble.h>
 
 #include "b64.h"
 
