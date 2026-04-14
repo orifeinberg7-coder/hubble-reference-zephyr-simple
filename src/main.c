@@ -1,18 +1,17 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/sensor.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gap.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 
 #include <hubble/hubble.h>
 
 #include "b64.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
-
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
 
 static uint8_t master_key[CONFIG_HUBBLE_KEY_SIZE];
 static const char master_key_str[] = HUBBLE_KEY;
@@ -32,6 +31,7 @@ static const struct gpio_dt_spec led    = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
 
 static volatile bool led_state = false;
+static volatile uint16_t button_count = 0;
 static struct gpio_callback button_cb_data;
 
 static uint16_t app_adv_uuids[1] = { HUBBLE_BLE_UUID };
@@ -49,9 +49,48 @@ static void button_pressed(const struct device *dev,
                             struct gpio_callback *cb, uint32_t pins)
 {
     led_state = !led_state;
+    button_count++;
     gpio_pin_set_dt(&led, led_state);
     k_sem_give(&timer_sem);
-    LOG_INF("Button pressed — LED %s", led_state ? "ON" : "OFF");
+    LOG_INF("Button #%u — LED %s", button_count, led_state ? "ON" : "OFF");
+}
+
+static int8_t read_die_temp(const struct device *temp_dev)
+{
+    struct sensor_value val;
+
+    if (sensor_sample_fetch(temp_dev) != 0) {
+        LOG_WRN("Temp fetch failed");
+        return -128;
+    }
+    sensor_channel_get(temp_dev, SENSOR_CHAN_DIE_TEMP, &val);
+    LOG_INF("Die temp: %d.%06d °C", val.val1, val.val2);
+    return (int8_t)val.val1;
+}
+
+/*
+ * Payload format (6 bytes):
+ *   [0]   0x4C   — type marker
+ *   [1]   LED    — 0x00=OFF, 0x01=ON
+ *   [2]   temp   — signed die temperature in °C
+ *   [3-4] count  — button presses since boot (big-endian)
+ *   [5]   uptime — minutes since boot (wraps at 255)
+ */
+#define PAYLOAD_LEN 6
+
+static void build_payload(uint8_t *buf, const struct device *temp_dev)
+{
+    int8_t temp = read_die_temp(temp_dev);
+    uint32_t uptime_min = k_uptime_get() / 60000;
+
+    buf[0] = 0x4C;
+    buf[1] = led_state ? 0x01 : 0x00;
+    buf[2] = (uint8_t)temp;
+    sys_put_be16(button_count, &buf[3]);
+    buf[5] = (uint8_t)(uptime_min & 0xFF);
+
+    LOG_INF("Payload: LED=%u temp=%d°C btn=%u up=%um",
+            buf[1], temp, button_count, uptime_min & 0xFF);
 }
 
 static int decode_master_key(void)
@@ -80,7 +119,13 @@ int main(void)
     gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));
     gpio_add_callback(button.port, &button_cb_data);
 
-    LOG_INF("Hubble LED-toggle beacon started");
+    const struct device *temp_dev = DEVICE_DT_GET(DT_NODELABEL(temp));
+    if (!device_is_ready(temp_dev)) {
+        LOG_ERR("Die temperature sensor not ready");
+        return -1;
+    }
+
+    LOG_INF("Hubble multi-sensor beacon started");
 
     err = bt_enable(NULL);
     if (err != 0) { LOG_ERR("Bluetooth init failed (err %d)", err); return err; }
@@ -97,8 +142,9 @@ int main(void)
 
     while (1) {
         size_t out_len = HUBBLE_USER_BUFFER_LEN;
+        uint8_t custom_payload[PAYLOAD_LEN];
 
-        uint8_t custom_payload[2] = { 0x4C, led_state ? 0x01 : 0x00 };
+        build_payload(custom_payload, temp_dev);
 
         err = hubble_ble_advertise_get(custom_payload, sizeof(custom_payload),
                                        _hubble_user_buffer, &out_len);
